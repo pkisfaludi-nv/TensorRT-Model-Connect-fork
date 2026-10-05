@@ -82,3 +82,52 @@ def test_distilled_schedule_is_the_eight_step_checkpoint_schedule() -> None:
     assert len(model.DISTILLED_SIGMAS) == 8
     assert model.DISTILLED_SIGMAS[0] == 1.0
     assert list(model.DISTILLED_SIGMAS) == sorted(model.DISTILLED_SIGMAS, reverse=True)
+
+
+def test_shared_build_request_accepts_nvfp4() -> None:
+    from families.ltx2.cli import coerce_request
+
+    request = coerce_request(_request(quantization="nvfp4"))
+    assert request.quantization == "nvfp4"
+    assert request.attention == "bf16"  # the shared CLI has no attention option
+    assert coerce_request(_request()).quantization == "none"
+
+
+@pytest.mark.parametrize("overrides", [{"quantization": "fp8"}, {"quantization": "int4"}, {"attention": "fp4"},
+                                       {"attention": "nvfp4"}])
+def test_family_build_request_rejects_unknown_quantization(overrides: dict) -> None:
+    from families.ltx2.cli import BuildRequest
+
+    with pytest.raises(ValueError):
+        BuildRequest(model_dir="/nonexistent/ltx2", **overrides)
+
+
+def test_cli_quantization_choices_match_the_builder() -> None:
+    import json
+    from pathlib import Path
+
+    from families.ltx2.cli import ATTENTION_CHOICES, QUANTIZATION_CHOICES
+
+    spec = json.loads((Path(model.__file__).parent / "cli.json").read_text(encoding="utf-8"))
+    args = {a["name"]: a for a in spec["commands"][0]["arguments"]}
+    assert tuple(args["quantization"]["choices"]) == QUANTIZATION_CHOICES
+    assert args["quantization"]["default"] == "none"
+    assert tuple(args["attention"]["choices"]) == ATTENTION_CHOICES
+    assert args["attention"]["default"] == "bf16"
+
+
+def test_default_build_is_unquantized() -> None:
+    from families.ltx2.cli import BuildRequest
+
+    assert model._dit_quantization(BuildRequest(model_dir="/nonexistent/ltx2")) == (None, None)
+
+
+@pytest.mark.parametrize("gemm,attention", [("nvfp4", "bf16"), ("none", "fp8"), ("nvfp4", "fp8")])
+def test_quantized_build_reads_the_calibration_and_records_it(gemm: str, attention: str) -> None:
+    from families.ltx2.cli import BuildRequest
+
+    quant, info = model._dit_quantization(BuildRequest(model_dir="/nonexistent/ltx2", quantization=gemm,
+                                                       attention=attention))
+    assert (quant.gemm, quant.attention) == (gemm, attention)
+    assert info["gemm"] == gemm and info["attention"] == attention
+    assert info["calibration"] == "ltx25-distilled-amax.json" and len(info["calibration_sha256"]) == 64

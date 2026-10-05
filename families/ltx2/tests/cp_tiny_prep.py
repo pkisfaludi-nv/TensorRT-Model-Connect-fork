@@ -4,8 +4,8 @@
 """Single-rank preparation for the multi-rank CP check (uses torch + diffusers).
 
 ``python -m families.ltx2.tests.cp_tiny_prep OUT_DIR CP``: builds the tiny random DiT, its
-single-device and CP plans, and the diffusers reference outputs for the normal, mixed-STG and
-modality-isolated batches. The multi-rank step (``dist_dit_cp_check``) is torch-free.
+single-device and CP plans (bf16, and NVFP4 + FP8 attention), and the diffusers reference outputs for
+the normal, mixed-STG and modality-isolated batches. The multi-rank step (``dist_dit_cp_check``) is torch-free.
 """
 
 from __future__ import annotations
@@ -64,6 +64,17 @@ def main() -> int:
     arrays.update({f"small_{k}": v.float().numpy() for k, v in small_inp.items()})
     arrays["small_ref_video"] = rv.numpy()
     arrays["small_ref_audio"] = ra.numpy()
+    # Quantized plans (NVFP4 GEMMs + FP8 video self-attention), calibrated on the same inputs.
+    from families.ltx2.calibrate import AmaxRecorder
+    from families.ltx2.quantization import DitQuantization
+
+    with AmaxRecorder(model) as recorder:
+        tp._reference(model, shape, inp, torch.float32)
+    quant = DitQuantization(gemm="nvfp4", attention="fp8", amax=recorder.result())
+    (out / "single_quant.plan").write_bytes(build_dit_engine(folder, shape, cp_size=1, stg_blocks=(tp.STG_BLOCK,),
+                                                             quant=quant))
+    (out / f"cp{cp}_quant.plan").write_bytes(build_dit_engine(folder, shape, cp_size=cp, stg_blocks=(tp.STG_BLOCK,),
+                                                              quant=quant))
     np.savez(out / "reference.npz", **arrays)
     print(f"prepared {out} (video tokens {shape.video_tokens}, audio {sa}, cp {cp})", flush=True)
     return 0

@@ -57,15 +57,15 @@ def _randomize(module, seed: int) -> None:
                 p.copy_(0.1 * torch.randn(p.shape, generator=gen))
 
 
-@pytest.fixture(scope="module")
-def tiny(tmp_path_factory):
+def tiny_checkpoint(root):
+    """The tiny random diffusers DiT, its bf16 checkpoint folder under ``root`` and its shape."""
     from diffusers import LTX2VideoTransformer3DModel
 
-    from families.ltx2.dit_builder import DiTShape, audio_latent_frames, build_dit_engine
+    from families.ltx2.dit_builder import DiTShape, audio_latent_frames
 
     model = LTX2VideoTransformer3DModel(**TINY_DIT).eval()
     _randomize(model, 5)
-    folder = tmp_path_factory.mktemp("tiny_dit") / "transformer"
+    folder = root / "transformer"
     folder.mkdir()
     safetensors_torch.save_file({k: v.to(torch.bfloat16).contiguous() for k, v in model.state_dict().items()},
                                 str(folder / "diffusion_pytorch_model.safetensors"))
@@ -74,6 +74,14 @@ def tiny(tmp_path_factory):
     sa = audio_latent_frames(num_frames, FPS)
     shape = DiTShape(batch=2, latent_frames=FRAMES, latent_height=LH, latent_width=LW, audio_frames=sa,
                      text_len=TEXT, fps=FPS)
+    return model, folder, shape
+
+
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    from families.ltx2.dit_builder import build_dit_engine
+
+    model, folder, shape = tiny_checkpoint(tmp_path_factory.mktemp("tiny_dit"))
     plan = build_dit_engine(folder, shape, stg_blocks=(STG_BLOCK,))
     return model, plan, shape, folder
 

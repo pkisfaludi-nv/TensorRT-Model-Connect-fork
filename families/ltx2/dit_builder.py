@@ -28,6 +28,13 @@ baked in one after the other, and the run-time token count selects the rows of i
 Precision: bf16 strongly typed (diffusers runs this model in bf16), with fp32 RMSNorm /
 LayerNorm statistics, fp32 split RoPE, fp32 timestep sinusoids and fp32 GELU/SiLU islands.
 
+Quantization (``quant``, opt-in; ``quantization.py``):
+    - ``gemm="nvfp4"``: the linears on the video token stream (``NVFP4_VIDEO_LINEARS``: self-attention
+      Q/K/V/out, text cross-attention Q/out, a2v Q/out, v2a K/V, feed-forward) run as NVFP4 GEMMs.
+      The audio stream (251 tokens), the text-side K/V, the gate logits, AdaLN, proj_in/proj_out stay bf16:
+      they are a small share of the FLOPs and the most sensitive to quantization.
+    - ``attention="fp8"``: the video self-attention runs with FP8 Q/K/V and an FP8 softmax.
+
 Context parallelism (``cp_size`` ranks, contiguous token shards of ``S / cp`` rows):
     - every rank derives its index with one tiny REDUCE_SCATTER and gathers its own latent
       rows and RoPE rows;
@@ -73,6 +80,7 @@ from .layers import (
     to_heads,
 )
 from .parallel import add_collective, local_row_indices, local_row_start
+from .quantization import DitQuantization, fp8_attention, nvfp4_global_scale, nvfp4_linear, quantize_nvfp4_weight
 
 EPS = 1e-6
 _FP16_SAFE_BF16_MAX = 65280.0  # largest bf16 value that is finite in fp16
@@ -248,6 +256,51 @@ def _mod_params(g: Graph, table: np.ndarray, temb, batch: int):
     return [g.reshape(g.slice(vals, (0, 0, i, 0), (batch, 1, 1, d)), (batch, 1, d)) for i in range(n)]
 
 
+# ---------------------------------------------------------------------- quantization
+
+# The block linears whose rows are video tokens: the DiT's GEMM cost at 27k tokens.
+NVFP4_VIDEO_LINEARS = (
+    "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
+    "attn2.to_q", "attn2.to_out.0",
+    "audio_to_video_attn.to_q", "audio_to_video_attn.to_out.0",
+    "video_to_audio_attn.to_k", "video_to_audio_attn.to_v",
+    "ff.net.0.proj", "ff.net.2",
+)
+# The NVFP4 activation global scale only bounds the per-16 block scales (E4M3): a block whose amax
+# exceeds the global amax saturates. The headroom covers activations beyond the calibration set
+# (calibrated at a smaller resolution) at no cost in precision: the E4M3 block scales keep 3
+# mantissa bits down to 2^-6 * 448 / NVFP4_AMAX_HEADROOM below the global amax.
+NVFP4_AMAX_HEADROOM = 2.0
+
+
+class QuantLinears:
+    """Linear provider of the DiT blocks (``AttnWeights.linear``): NVFP4 for ``NVFP4_VIDEO_LINEARS``."""
+
+    def __init__(self, ckpt: Checkpoint, quant: DitQuantization):
+        self.ckpt = ckpt
+        self.quant = quant
+        self.quantized: list[str] = []
+
+    def __call__(self, g: Graph, x, name: str):
+        if self.quant.gemm != "nvfp4":
+            return None
+        parts = name.split(".", 2)
+        if len(parts) != 3 or parts[0] != "transformer_blocks" or parts[2] not in NVFP4_VIDEO_LINEARS:
+            return None
+        weight = quantize_nvfp4_weight(self.ckpt.get(f"{name}.weight", np.float32))
+        scale = nvfp4_global_scale(self.quant.input_amax(name) * NVFP4_AMAX_HEADROOM)
+        self.quantized.append(name)
+        return nvfp4_linear(g, x, weight, scale, self.ckpt.maybe(f"{name}.bias"))
+
+
+def _attention_core(g: Graph, quant: DitQuantization | None, prefix: str, head_dim: int):
+    """FP8 core for the video self-attention ``prefix`` (``None``: bf16 ``IAttention``)."""
+    if quant is None or quant.attention != "fp8":
+        return None
+    scales = quant.attention_scales(prefix, head_dim)
+    return lambda q, k, v: fp8_attention(g, q, k, v, scales)
+
+
 # ---------------------------------------------------------------------- context-parallel attention
 
 
@@ -266,14 +319,15 @@ def _ag_tokens(g: Graph, x, cp: int):
 
 
 def _video_self_attention(g: Graph, aw: AttnWeights, x_n, *, heads: int, rope: RopeTables, cp: int,
-                          gated: bool, stg_keep):
+                          gated: bool, stg_keep, core=None):
     if cp == 1:
         return ltx_attention(g, aw, x_n, x_n, heads=heads, eps=EPS, q_rope=rope, k_rope=rope, gated=gated,
-                             stg_keep=stg_keep)
+                             stg_keep=stg_keep, core=core)
     # Local queries attend the gathered keys/values; Q/K RMSNorm and RoPE are row-local.
     q, k, v = project_qkv(g, aw, x_n, x_n, eps=EPS, q_rope=rope, k_rope=rope)
     kf, vf = _ag_tokens(g, k, cp), _ag_tokens(g, v, cp)
-    ctx = from_heads(g, g.attention(to_heads(g, q, heads), to_heads(g, kf, heads), to_heads(g, vf, heads)))
+    q4, k4, v4 = to_heads(g, q, heads), to_heads(g, kf, heads), to_heads(g, vf, heads)
+    ctx = from_heads(g, core(q4, k4, v4) if core is not None else g.attention(q4, k4, v4))
     if stg_keep is not None:
         ctx = stg_lerp(g, v, ctx, stg_keep)
     return gate_and_project_out(g, aw, ctx, x_n, heads, gated=gated)
@@ -357,12 +411,14 @@ def _grid_rows(g: Graph, video_latent, shape: DiTShape, extra: DiTShape, cp: int
 
 def add_dit(g: Graph, ckpt: Checkpoint, cfg: DiTConfig, shape: DiTShape, inputs: dict, *, cp: int = 1,
             stg_blocks: tuple[int, ...] = (), num_layers: int | None = None,
-            extra_shapes: tuple[DiTShape, ...] = ()):
+            extra_shapes: tuple[DiTShape, ...] = (), quant: DitQuantization | None = None):
     """Adds the DiT; returns (video_velocity ``[B, S_local, C]`` bf16, audio_velocity ``[B, Sa, C]`` bf16).
 
     ``extra_shapes`` (at most one): a second video grid served by the same plan. The video token
     count is then a run-time dimension and picks the RoPE rows of its grid.
+    ``quant``: optional NVFP4 GEMMs / FP8 video self-attention (module docstring).
     """
+    linear = QuantLinears(ckpt, quant) if quant is not None and quant.gemm != "none" else None
     B = shape.batch
     S = shape.video_tokens
     _check_grids(shape, extra_shapes, cp, cfg)
@@ -426,8 +482,10 @@ def add_dit(g: Graph, ckpt: Checkpoint, cfg: DiTConfig, shape: DiTShape, inputs:
         am = _mod_params(g, ckpt.get(f"{p}.audio_scale_shift_table"), temb_a, B)
         # 1. self-attention
         xn = modulate(g, g.rms_norm(x, None, EPS), vm[1], vm[0])
-        x = g.add(x, g.mul(_video_self_attention(g, AttnWeights(ckpt, f"{p}.attn1"), xn, heads=cfg.heads,
-                                                 rope=rope_v, cp=cp, gated=cfg.gated, stg_keep=stg), vm[2]))
+        x = g.add(x, g.mul(_video_self_attention(g, AttnWeights(ckpt, f"{p}.attn1", linear), xn, heads=cfg.heads,
+                                                 rope=rope_v, cp=cp, gated=cfg.gated, stg_keep=stg,
+                                                 core=_attention_core(g, quant, f"{p}.attn1", cfg.head_dim)),
+                           vm[2]))
         an = modulate(g, g.rms_norm(a, None, EPS), am[1], am[0])
         a = g.add(a, g.mul(ltx_attention(g, AttnWeights(ckpt, f"{p}.audio_attn1"), an, an, heads=cfg.audio_heads,
                                          eps=EPS, q_rope=rope_a, k_rope=rope_a, gated=cfg.audio_gated,
@@ -448,7 +506,8 @@ def add_dit(g: Graph, ckpt: Checkpoint, cfg: DiTConfig, shape: DiTShape, inputs:
         xn = g.rms_norm(x, None, EPS)
         if cfg.cross_attn_mod:
             xn = modulate(g, xn, vm[7], vm[6])
-        out = ltx_attention(g, AttnWeights(ckpt, f"{p}.attn2"), xn, ctx_v, heads=cfg.heads, eps=EPS, gated=cfg.gated)
+        out = ltx_attention(g, AttnWeights(ckpt, f"{p}.attn2", linear), xn, ctx_v, heads=cfg.heads, eps=EPS,
+                            gated=cfg.gated)
         if cfg.cross_attn_mod:
             out = g.mul(out, vm[8])
         x = g.add(x, out)
@@ -469,17 +528,18 @@ def add_dit(g: Graph, ckpt: Checkpoint, cfg: DiTConfig, shape: DiTShape, inputs:
         a_a2v_scale, a_a2v_shift, a_v2a_scale, a_v2a_shift = _mod_params(g, at[:4], ca_a, B)
         a2v_gate = _mod_params(g, vt[4:], gate_v, B)[0]
         v2a_gate = _mod_params(g, at[4:], gate_a, B)[0]
-        a2v = ltx_attention(g, AttnWeights(ckpt, f"{p}.audio_to_video_attn"), modulate(g, xn, v_a2v_scale, v_a2v_shift),
+        a2v = ltx_attention(g, AttnWeights(ckpt, f"{p}.audio_to_video_attn", linear),
+                            modulate(g, xn, v_a2v_scale, v_a2v_shift),
                             modulate(g, an, a_a2v_scale, a_a2v_shift), heads=cfg.audio_heads, eps=EPS,
                             q_rope=rope_ca_v, k_rope=rope_ca_a, gated=cfg.gated)
-        v2a = _v2a_attention(g, AttnWeights(ckpt, f"{p}.video_to_audio_attn"),
+        v2a = _v2a_attention(g, AttnWeights(ckpt, f"{p}.video_to_audio_attn", linear),
                              modulate(g, an, a_v2a_scale, a_v2a_shift), modulate(g, xn, v_v2a_scale, v_v2a_shift),
                              heads=cfg.audio_heads, q_rope=rope_ca_a, k_rope=rope_ca_v, cp=cp, gated=cfg.audio_gated)
         x = g.add(x, g.mul(g.mul(a2v_gate, a2v), av_keep))
         a = g.add(a, g.mul(g.mul(v2a_gate, v2a), av_keep))
         # 4. feed-forward
         xn = modulate(g, g.rms_norm(x, None, EPS), vm[4], vm[3])
-        x = g.add(x, g.mul(feed_forward(g, ckpt, f"{p}.ff", xn), vm[5]))
+        x = g.add(x, g.mul(feed_forward(g, ckpt, f"{p}.ff", xn, linear), vm[5]))
         an = modulate(g, g.rms_norm(a, None, EPS), am[4], am[3])
         a = g.add(a, g.mul(feed_forward(g, ckpt, f"{p}.audio_ff", an), am[5]))
 
@@ -509,7 +569,8 @@ def _gather_video_rows(g: Graph, y, cp: int, batch: int):
 
 def build_dit_engine(transformer_dir: str | Path, shape: DiTShape, *, cp_size: int = 1,
                      stg_blocks: tuple[int, ...] = (28,), num_layers: int | None = None,
-                     verbose: bool = False, extra_shapes: tuple[DiTShape, ...] = ()) -> bytes:
+                     verbose: bool = False, extra_shapes: tuple[DiTShape, ...] = (),
+                     quant: DitQuantization | None = None) -> bytes:
     """Serialized DiT plan for ``shape``; ``extra_shapes`` adds one more video grid (run-time token count)."""
     ckpt = Checkpoint(transformer_dir)
     cfg = DiTConfig.from_dict(ckpt.config())
@@ -530,7 +591,7 @@ def build_dit_engine(transformer_dir: str | Path, shape: DiTShape, *, cp_size: i
     if cfg.cross_attention_dim != cfg.dim or cfg.audio_cross_attention_dim != cfg.audio_dim:
         raise NotImplementedError("LTX-2.5 DiT builder expects the connector widths to match the streams")
     video, audio = add_dit(g, ckpt, cfg, shape, inputs, cp=cp_size, stg_blocks=stg_blocks, num_layers=num_layers,
-                           extra_shapes=tuple(extra_shapes))
+                           extra_shapes=tuple(extra_shapes), quant=quant)
     if cp_size > 1:
         video = _gather_video_rows(g, video, cp_size, B)
     g.mark_output(video, "video_velocity", trt.float32)
@@ -539,7 +600,8 @@ def build_dit_engine(transformer_dir: str | Path, shape: DiTShape, *, cp_size: i
     if len(tokens) > 1:
         profile = {"video_latent": tuple((B, s, cfg.in_channels) for s in (tokens[0], S, tokens[-1]))}
     print(f"[ltx2] Building DiT engine (batch={B}, video_tokens={'/'.join(map(str, tokens))}, audio_tokens={Sa}, "
-          f"cp={cp_size}, layers={num_layers or cfg.layers}) ...", file=sys.stderr)
+          f"cp={cp_size}, layers={num_layers or cfg.layers}, gemm={quant.gemm if quant else 'none'}, "
+          f"attention={quant.attention if quant else 'bf16'}) ...", file=sys.stderr)
     return build_plan(builder, network, label="DiT", profile=profile)
 
 

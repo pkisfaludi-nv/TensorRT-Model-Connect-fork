@@ -16,7 +16,9 @@ Builds a native TRTMC bundle from a diffusers LTX-2.5 checkpoint (distilled ``tr
   - ``tokenizer.json`` and ``runtime.json``
 
 Every engine is built directly with the TensorRT network API in bf16 (the precision LTX-2.5 is
-trained and released in). The runtime path is C++ + TensorRT (or TensorRT-RTX) only.
+trained and released in). Opt-in, the DiT runs its video-stream GEMMs in NVFP4 (``--quantization
+nvfp4``) and its video self-attention in FP8 (``--attention fp8``); see ``quantization.py``. The
+runtime path is C++ + TensorRT (or TensorRT-RTX) only.
 """
 
 from __future__ import annotations
@@ -117,6 +119,21 @@ def _stage1_shape(model_dir: Path, shape, height: int, width: int, spatial: int)
     return replace(shape, latent_height=shape.latent_height // 2, latent_width=shape.latent_width // 2)
 
 
+def _dit_quantization(request: BuildRequest):
+    """(``DitQuantization`` or None, provenance for ``runtime.json`` or None) of a build request."""
+    if request.quantization == "none" and request.attention == "bf16":
+        return None, None
+    import hashlib
+
+    from .quantization import DEFAULT_CALIBRATION, DitQuantization, load_amax
+
+    path = Path(request.calibration) if request.calibration else DEFAULT_CALIBRATION
+    quant = DitQuantization(gemm=request.quantization, attention=request.attention, amax=load_amax(path))
+    info = {"gemm": request.quantization, "attention": request.attention, "calibration": path.name,
+            "calibration_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return quant, info
+
+
 def build(request: BuildRequest, writer: "BundleWriter") -> None:
     """Build one LTX-2.5 text-to-audio-video bundle (``trtmc ltx2 build`` or the shared ``trtmc build``)."""
     request = coerce_request(request)
@@ -177,6 +194,7 @@ def build(request: BuildRequest, writer: "BundleWriter") -> None:
         validate_context_parallel_layout(parallel, video_tokens=stage1.video_tokens, video_heads=dit_cfg.heads,
                                          audio_heads=dit_cfg.audio_heads)
 
+    quant, quant_info = _dit_quantization(request)
     writer.set_header(family="ltx2", task=request.task, backend=request.backend)
     started = time.perf_counter()
     _write_plan(writer, "text_encoder.plan", build_text_encoder_engine(model_dir, seq_len=text_len,
@@ -185,7 +203,7 @@ def build(request: BuildRequest, writer: "BundleWriter") -> None:
     started = time.perf_counter()
     _write_plan(writer, "denoiser.plan", build_dit_engine(model_dir / "transformer", shape, cp_size=parallel.cp_size,
                                                           verbose=request.verbose,
-                                                          extra_shapes=(stage1,) if stage1 else ()))
+                                                          extra_shapes=(stage1,) if stage1 else (), quant=quant))
     _log(f"DiT engine built in {time.perf_counter() - started:.1f} s (cp={parallel.cp_size}, "
          f"{shape.video_tokens}{f' / {stage1.video_tokens}' if stage1 else ''} video + "
          f"{shape.audio_frames} audio tokens)")
@@ -237,6 +255,8 @@ def build(request: BuildRequest, writer: "BundleWriter") -> None:
     }
     if tiling is not None:
         runtime["vae_tiling"] = tiling
+    if quant_info is not None:
+        runtime["dit_quantization"] = quant_info
     if stage1 is not None:
         runtime["two_stage"] = {
             "latent_height": stage1.latent_height,

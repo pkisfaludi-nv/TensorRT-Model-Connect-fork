@@ -22,6 +22,9 @@
         {"name": "vae_tile_frames", "flags": ["--vae-tile-frames"], "type": "int", "default": 256, "help": "Video VAE tile length in frames (0: untiled time axis)"},
         {"name": "vae_tile_overlap_frames", "flags": ["--vae-tile-overlap-frames"], "type": "int", "default": 24, "help": "Minimum temporal tile overlap in frames"},
         {"name": "two_stage", "flags": ["--two-stage"], "type": "bool", "action": "store_true", "default": false, "help": "Also build the two-stage pipeline (half-resolution stage 1, latent upsampler, full-resolution refinement); run it with --set two_stage=true"},
+        {"name": "quantization", "flags": ["--quantization"], "type": "string", "choices": ["none", "nvfp4"], "default": "none", "help": "DiT GEMM quantization: nvfp4 runs the video-stream linears as NVFP4 GEMMs (calibrated activation scales)"},
+        {"name": "attention", "flags": ["--attention"], "type": "string", "choices": ["bf16", "fp8"], "default": "bf16", "help": "DiT video self-attention precision: fp8 quantizes Q/K/V and the softmax to FP8 (calibrated scales)"},
+        {"name": "calibration", "flags": ["--calibration"], "type": "path", "help": "Activation amax JSON for --quantization / --attention (default: the family's calibration/ltx25-distilled-amax.json)"},
         {"name": "verbose", "flags": ["--verbose"], "type": "bool", "action": "store_true", "default": false}
       ]
     }

@@ -95,11 +95,21 @@ def from_heads(g: Graph, x):
 
 
 class AttnWeights:
-    """Weights of one ``LTX2Attention`` (checkpoint layout) fetched lazily from a checkpoint."""
+    """Weights of one ``LTX2Attention`` (checkpoint layout) fetched lazily from a checkpoint.
 
-    def __init__(self, ckpt, prefix: str):
+    ``linear``: optional ``(g, x, name) -> tensor or None`` provider for the projections (``name`` is
+    the checkpoint layer name, e.g. ``transformer_blocks.3.attn1.to_q``). It returns ``None`` for the
+    projections it leaves to the bf16 path; the DiT uses it for its NVFP4 projections.
+    """
+
+    def __init__(self, ckpt, prefix: str, linear=None):
         self.prefix = prefix
         self.ckpt = ckpt
+        self.linear = linear
+
+    def project(self, g: Graph, x, name: str):
+        """``x @ W^T + b`` of the projection ``name`` (``to_q``, ``to_out.0``, ...)."""
+        return checkpoint_linear(g, self.ckpt, f"{self.prefix}.{name}", x, self.linear)
 
     def w(self, name: str):
         return self.ckpt.get(f"{self.prefix}.{name}")
@@ -116,15 +126,15 @@ def project_qkv(g: Graph, aw: AttnWeights, x_q, x_kv, *, eps: float,
     """to_q/to_k/to_v + across-heads RMSNorm + split RoPE; returns (q, k, v) as ``[B, T, inner]``."""
     q = None
     if need_q:
-        q = g.linear(x_q, aw.w("to_q.weight"), aw.maybe("to_q.bias"))
+        q = aw.project(g, x_q, "to_q")
         q = g.rms_norm(q, aw.f32("norm_q.weight"), eps)
         if q_rope is not None:
             q = apply_split_rope(g, q, q_rope)
-    k = g.linear(x_kv, aw.w("to_k.weight"), aw.maybe("to_k.bias"))
+    k = aw.project(g, x_kv, "to_k")
     k = g.rms_norm(k, aw.f32("norm_k.weight"), eps)
     if k_rope is not None:
         k = apply_split_rope(g, k, k_rope)
-    v = g.linear(x_kv, aw.w("to_v.weight"), aw.maybe("to_v.bias"))
+    v = aw.project(g, x_kv, "to_v")
     return q, k, v
 
 
@@ -132,25 +142,32 @@ def gate_and_project_out(g: Graph, aw: AttnWeights, ctx, x_q, heads: int, *, gat
     """Per-head ``2*sigmoid`` gates (from the query input) and ``to_out.0``; ``ctx`` is ``[B, T, inner]``."""
     if gated:
         b, t, inner = (int(s) for s in ctx.shape)
-        logits = g.linear(x_q, aw.w("to_gate_logits.weight"), aw.maybe("to_gate_logits.bias"))  # [B,T,H]
+        logits = aw.project(g, x_q, "to_gate_logits")  # [B,T,H]
         gates = g.mul(g.sigmoid(g.cast(logits, trt.float32)), g.scalar(2.0, trt.float32, 3))
         gates = g.cast(g.reshape(gates, (b, t, heads, 1)), ctx.dtype)
         ctx = g.reshape(g.mul(g.reshape(ctx, (b, t, heads, inner // heads)), gates), (b, t, inner))
-    return g.linear(ctx, aw.w("to_out.0.weight"), aw.maybe("to_out.0.bias"))
+    return aw.project(g, ctx, "to_out.0")
 
 
 def ltx_attention(g: Graph, aw: AttnWeights, x_q, x_kv, *, heads: int, eps: float,
                   q_rope: RopeTables | None = None, k_rope: RopeTables | None = None,
-                  gated: bool = True, mask=None, stg_keep=None):
+                  gated: bool = True, mask=None, stg_keep=None, core=None):
     """Full ``LTX2Attention`` forward (single device).
 
     ``stg_keep``: optional ``[B, 1, 1]`` mask for spatio-temporal guidance; batch rows
     with 0 replace the attention context by the value projection
     (``torch.lerp(value, attn, mask)`` in ``LTX2PerturbedAttnProcessor``).
+    ``core``: optional ``(q, k, v) -> ctx`` over ``[B, H, S, D]`` replacing the bf16 softmax attention
+    (the DiT's FP8 attention); not combined with ``mask``.
     """
     q, k, v = project_qkv(g, aw, x_q, x_kv, eps=eps, q_rope=q_rope, k_rope=k_rope)
-    ctx = from_heads(g, g.attention(to_heads(g, q, heads), to_heads(g, k, heads), to_heads(g, v, heads),
-                                    mask=mask))
+    q4, k4, v4 = to_heads(g, q, heads), to_heads(g, k, heads), to_heads(g, v, heads)
+    if core is not None:
+        if mask is not None:
+            raise ValueError("a custom attention core does not take a mask")
+        ctx = from_heads(g, core(q4, k4, v4))
+    else:
+        ctx = from_heads(g, g.attention(q4, k4, v4, mask=mask))
     if stg_keep is not None:
         ctx = stg_lerp(g, v, ctx, stg_keep)
     return gate_and_project_out(g, aw, ctx, x_q, heads, gated=gated)
@@ -167,11 +184,20 @@ def stg_lerp(g: Graph, value, ctx, keep):
     return g.select(cond, ctx, value)
 
 
-def feed_forward(g: Graph, ckpt, prefix: str, x):
+def checkpoint_linear(g: Graph, ckpt, name: str, x, linear=None):
+    """The checkpoint linear ``name`` on ``x``: the ``linear`` provider's result, else bf16 ``g.linear``."""
+    if linear is not None:
+        y = linear(g, x, name)
+        if y is not None:
+            return y
+    return g.linear(x, ckpt.get(f"{name}.weight"), ckpt.maybe(f"{name}.bias"))
+
+
+def feed_forward(g: Graph, ckpt, prefix: str, x, linear=None):
     """diffusers ``FeedForward(activation_fn="gelu-approximate")``: proj -> GELU(tanh) -> proj."""
-    h = g.linear(x, ckpt.get(f"{prefix}.net.0.proj.weight"), ckpt.maybe(f"{prefix}.net.0.proj.bias"))
+    h = checkpoint_linear(g, ckpt, f"{prefix}.net.0.proj", x, linear)
     h = g.gelu_tanh(h)
-    return g.linear(h, ckpt.get(f"{prefix}.net.2.weight"), ckpt.maybe(f"{prefix}.net.2.bias"))
+    return checkpoint_linear(g, ckpt, f"{prefix}.net.2", h, linear)
 
 
 def modulate(g: Graph, x, scale, shift):

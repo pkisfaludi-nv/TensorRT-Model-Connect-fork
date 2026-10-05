@@ -14,6 +14,10 @@ from tensorrt_model_connect.model_support import resolve_model
 
 from .vae_tiling import TileConfig
 
+# The DiT's opt-in quantization options (``quantization.py``; kept here so this module stays CPU-only).
+QUANTIZATION_CHOICES = ("none", "nvfp4")
+ATTENTION_CHOICES = ("bf16", "fp8")
+
 TASK = "text_to_audio_video"
 
 
@@ -30,11 +34,18 @@ class BuildRequest:
     context_parallel_size: int = 1
     vae_tiles: TileConfig = field(default_factory=TileConfig)
     two_stage: bool = False
+    quantization: str = "none"
+    attention: str = "bf16"
+    calibration: Path | None = None
     verbose: bool = False
 
     def __post_init__(self) -> None:
         if self.backend not in {"trt", "trt_rtx"}:
             raise ValueError("backend must be 'trt' or 'trt_rtx'")
+        if self.quantization not in QUANTIZATION_CHOICES:
+            raise ValueError(f"ltx2 quantization must be one of {', '.join(QUANTIZATION_CHOICES)}")
+        if self.attention not in ATTENTION_CHOICES:
+            raise ValueError(f"ltx2 attention must be one of {', '.join(ATTENTION_CHOICES)}")
         self.vae_tiles.validate()
 
 
@@ -48,8 +59,10 @@ def coerce_request(request: object) -> BuildRequest:
         raise NotImplementedError("ltx2 requires tensor_parallel_size=1 (it shards the video tokens)")
     if getattr(request, "max_batch_size", 1) != 1:
         raise NotImplementedError("ltx2 requires max_batch_size=1")
-    if getattr(request, "quantization", None) not in (None, "none"):
-        raise NotImplementedError("ltx2 does not support quantization")
+    quantization = getattr(request, "quantization", None) or "none"
+    if quantization not in QUANTIZATION_CHOICES:
+        raise NotImplementedError(f"ltx2 supports quantization {', '.join(QUANTIZATION_CHOICES)} "
+                                  f"(got {quantization!r})")
     if getattr(request, "fp32_layers", ()):
         raise NotImplementedError("ltx2 does not support fp32_layers (its fp32 islands are fixed in the graph)")
     return BuildRequest(
@@ -59,7 +72,7 @@ def coerce_request(request: object) -> BuildRequest:
         image_height=getattr(request, "image_height", None), image_width=getattr(request, "image_width", None),
         video_num_frames=getattr(request, "video_num_frames", None),
         context_parallel_size=int(getattr(request, "context_parallel_size", 1)),
-        verbose=bool(getattr(request, "verbose", False)))
+        quantization=quantization, verbose=bool(getattr(request, "verbose", False)))
 
 
 def build_bundle(request: BuildRequest, output: Path) -> None:
@@ -80,6 +93,7 @@ def build(*, model: str, output: Path, revision: str | None = None, precision: s
           video_num_frames: int | None = None, max_sequence_length: int | None = None,
           context_parallel_size: int = 1, vae_tile_pixels: int = 512, vae_tile_overlap_pixels: int = 64,
           vae_tile_frames: int = 256, vae_tile_overlap_frames: int = 24, two_stage: bool = False,
+          quantization: str = "none", attention: str = "bf16", calibration: Path | None = None,
           verbose: bool = False) -> int:
     tiles = TileConfig(tile_pixels=vae_tile_pixels, overlap_pixels=vae_tile_overlap_pixels,
                        tile_frames=vae_tile_frames, overlap_frames=vae_tile_overlap_frames)
@@ -87,6 +101,7 @@ def build(*, model: str, output: Path, revision: str | None = None, precision: s
                            max_sequence_length=max_sequence_length, image_height=image_height,
                            image_width=image_width, video_num_frames=video_num_frames,
                            context_parallel_size=context_parallel_size, vae_tiles=tiles,
-                           two_stage=two_stage, verbose=verbose)
+                           two_stage=two_stage, quantization=quantization, attention=attention,
+                           calibration=Path(calibration) if calibration else None, verbose=verbose)
     build_bundle(request, output)
     return 0
